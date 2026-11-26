@@ -196,3 +196,37 @@ def test_rust_matches_boon_on_real_replay() -> None:
     assert df_rust["hero_id"].to_list() == df_boon["hero_id"].to_list()
     assert df_rust["chat_type"].to_list() == df_boon["chat_type"].to_list()
     assert df_rust["text"].to_list() == df_boon["text"].to_list()
+
+
+def test_fetch_recent_replay_jobs_exclude_and_sharding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from deadlock_chat.api import DeadlockApiClient
+
+    fake_salts = tmp_path / "salts.parquet"
+    pl.DataFrame(
+        {
+            "match_id": [10_000_001, 10_000_002, 10_000_003, 10_000_004, 10_000_005],
+            "cluster_id": [142, 143, 142, 144, 145],
+            "replay_salt": [111, 222, 333, 444, 555],
+            "created_ts": [1795000001, 1795000002, 1795000003, 1795000004, 1795000005],
+        }
+    ).write_parquet(fake_salts)
+
+    with DeadlockApiClient() as api:
+        monkeypatch.setattr(api, "_get_cached_salts_parquet", lambda days_back, cache_dir=None: str(fake_salts))
+
+        jobs = api.fetch_recent_replay_jobs_from_lake(
+            days_back=5,
+            limit=10,
+            exclude_match_ids={10_000_005, 10_000_002},
+        )
+        assert [j.match_id for j in jobs] == [10_000_004, 10_000_003, 10_000_001]
+
+        w0 = api.fetch_recent_replay_jobs_from_lake(
+            days_back=5, limit=10, exclude_match_ids={10_000_002}, worker_id=0, num_workers=2
+        )
+        w1 = api.fetch_recent_replay_jobs_from_lake(
+            days_back=5, limit=10, exclude_match_ids={10_000_002}, worker_id=1, num_workers=2
+        )
+        assert [j.match_id for j in w0] == [10_000_004]
+        assert [j.match_id for j in w1] == [10_000_005, 10_000_003, 10_000_001]
+

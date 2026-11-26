@@ -171,16 +171,18 @@ class DeadlockApiClient:
             )
 
         if exclude_match_ids:
-            con.execute("CREATE TEMP TABLE _seen (match_id UBIGINT)")
-            con.executemany(
-                "INSERT INTO _seen VALUES (?)",
-                [(int(mid),) for mid in exclude_match_ids],
+            import polars as pl
+
+            seen_df = pl.DataFrame(
+                {"match_id": [int(mid) for mid in exclude_match_ids]},
+                schema={"match_id": pl.UInt64},
             )
+            con.register("_seen", seen_df)
             query = f"""
             SELECT s.match_id, s.cluster_id, s.replay_salt, {ts_col}
             FROM {source_sql} s
-            LEFT ANTI JOIN _seen ON s.match_id = _seen.match_id
-            WHERE 1=1 {extra_where} {shard_clause}
+            LEFT JOIN _seen ON s.match_id = _seen.match_id
+            WHERE _seen.match_id IS NULL {extra_where} {shard_clause}
             ORDER BY s.match_id {order}
             LIMIT {int(limit)}
             """
