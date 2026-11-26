@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deadlock-all-chat"
+version = "0.1.0"
+description = "High-throughput Deadlock replay chat message collector and username query engine for Google Colab"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.1.0",
+    "polars>=1.0.0",
+    "pyarrow>=17.0.0",
+    "httpx>=0.27.0",
+    "zstandard>=0.23.0",
+]
+
+[project.optional-dependencies]
+boon = ["boon-deadlock>=0.11.0"]
+dev = ["pytest>=8.0.0", "boon-deadlock>=0.11.0"]
+
+[project.scripts]
+deadlock-chat = "deadlock_chat.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

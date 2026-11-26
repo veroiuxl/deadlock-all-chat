@@ -1,0 +1,22 @@
+# Rust build artifacts
+rust/chat-extractor/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+
+# Local data lake / scratch outputs
+data/
+*.dem
+*.dem.bz2
+*.dem.zst
+*.parquet
+*.ndjson
+*.jsonl
+.ipynb_checkpoints/
