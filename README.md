@@ -37,12 +37,12 @@ We evaluated three approaches on real Deadlock replays and built the fastest one
    ~98% of bytes in a Deadlock `.dem` file are `svc_PacketEntities` entity delta updates. Chat messages live in `CCitadelUserMsg_ChatMsg` (message ID `314`), player identities (`name`, `steamid`, `account_id`) live in the `userinfo` string table (`DEM_StringTables` / `DEM_FullPacket`), and match metadata (`match_id`, `start_time`, `duration_s`, `hero_id`, `team`) lives in `CCitadelUserMsg_PostMatchDetails` (ID `316`). Skipping all other messages in `O(1)` inside `CDemoPacket` cuts CPU time from ~1.3s to **~42 ms** while maintaining **100% parity** with `boon-deadlock`.
 2. **Magic-Byte Decompression (Zstd disguised as `.dem.bz2`):**
    Even though Valve replay URLs still end in `.dem.bz2`, newer Deadlock replays are actually **Zstandard** compressed (`28 B5 2F FD`, decompressing at >300 MB/s), while older replays use **Bzip2** (`BZh`). Our streaming decompressor sniffs magic bytes automatically and pipes HTTP chunks directly into the parser with **zero uncompressed `.dem` disk writes**.
-3. **Colab Runtime & Storage Math:**
+3. **High-Throughput Colab Engine (v0.2):**
    - **Use a standard CPU runtime** (no GPU needed — workload is network I/O + Zstd/Snappy CPU).
-   - Deadlock produces ~240k–300k matches/day with `replay_salt` in `match_salts` (average ~50 MB compressed per replay; Valve retains replays on its CDN for **~14–21 days**).
+   - **Continuous streaming pool + per-cluster round-robin scheduler:** Keeps `64`+ concurrent HTTP streams 100% saturated (no chunk straggler barriers!) while capping connections per Valve replay cluster (`--max-per-host 6` across Valve's ~68 clusters) to avoid per-host throttling.
+   - **Local `/tmp` staging & `match_salts` caching:** Caches recent `match_salts` locally in `/tmp` so repeat runs start in <1s, and stages Zstd Parquet writes to `/tmp` before moving to Google Drive FUSE.
+   - **Multi-worker sharding (`--worker-id / --num-workers`):** Run *N* Colab tabs or cloud VMs in parallel against the same storage directory with zero duplicate downloads (`match_id % num_workers == worker_id`).
    - Extracted chat data compresses to **~0.6–2 KB per match** in Zstd Parquet (**~70,000× smaller** than the source replays — 1,000,000 matches fit in ~1–2 GB on Google Drive).
-   - The Rust binary compiles once (~1–2 min) and caches itself to Google Drive (`bin/deadlock-chat-extractor`) so future Colab sessions boot in ~5 seconds.
-   - Checkpoints flush to `state/*.parquet` after every chunk so Colab disconnects never cause duplicate downloads.
 4. **Hybrid Collection + On-Demand Username Query:**
    - **Bulk Mode:** Continuously harvests matches from Deadlock API's public `match_salts` Parquet lake via DuckDB HTTP range queries.
    - **Username Lookup Mode:** Queries your local Parquet lake by username **and** resolves the player's Steam `account_id` via Deadlock API (`/v1/players/steam-search` + optional historical `steam_profile_observed_names`), optionally live-fetching & parsing any of their uncached recent replays in seconds and saving all players' messages back into the lake.
@@ -50,8 +50,8 @@ We evaluated three approaches on real Deadlock replays and built the fastest one
 ## Quickstart in Google Colab
 
 1. Open [`notebooks/deadlock_all_chat_colab.ipynb`](notebooks/deadlock_all_chat_colab.ipynb) in Google Colab (Runtime → **CPU**).
-2. Run **Cell 1** to mount Google Drive, install dependencies, and compile/cache `deadlock-chat-extractor`.
-3. Run **Cell 2** to bulk-harvest recent matches into your Drive Parquet lake (resumable across sessions).
+2. Run **Cell 1** to mount Google Drive, install dependencies, and compile/cache `deadlock-chat-extractor-v0.2`.
+3. Run **Cell 2** to bulk-harvest recent matches continuously into your Drive Parquet lake (resumable across sessions; set `NUM_WORKERS > 1` across multiple Colab tabs for linear scaling).
 4. Run **Cell 3** to query any Steam username (with optional on-demand live fetching of their recent matches).
 
 ## Local CLI Usage
@@ -63,8 +63,13 @@ pip install -e .
 # 2. Build the Rust streaming extractor (requires Rust/Cargo)
 deadlock-chat build
 
-# 3. Bulk-harvest 200 recent matches into ./data
-deadlock-chat --data-dir ./data harvest --matches 200 --chunk-size 50 --concurrency 16
+# 3. Bulk-harvest 2000 recent matches continuously into ./data
+deadlock-chat --data-dir ./data harvest --matches 2000 --concurrency 64 --max-per-host 6 --flush-every 250
+
+# 3b. Scale across 3 parallel workers sharing ./data (run in 3 terminals/machines)
+deadlock-chat --data-dir ./data harvest --matches 5000 --worker-id 0 --num-workers 3
+deadlock-chat --data-dir ./data harvest --matches 5000 --worker-id 1 --num-workers 3
+deadlock-chat --data-dir ./data harvest --matches 5000 --worker-id 2 --num-workers 3
 
 # 4. Query all chat messages typed by a username (with live fetch of uncached recent games)
 deadlock-chat --data-dir ./data lookup "SomeUsername"

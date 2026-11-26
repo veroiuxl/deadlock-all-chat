@@ -115,7 +115,8 @@ def extract_file_rust(path: Path | str, match_id: int = 0) -> pl.DataFrame:
 
 def extract_batch_rust(
     jobs: Iterable[MatchReplayJob],
-    concurrency: int = 16,
+    concurrency: int = 64,
+    max_per_host: int = 6,
     timeout_s: int = 120,
     retries: int = 2,
     verbose: bool = True,
@@ -156,6 +157,8 @@ def extract_batch_rust(
             str(status_file),
             "--concurrency",
             str(concurrency),
+            "--max-per-host",
+            str(max_per_host),
             "--timeout",
             str(timeout_s),
             "--retries",
@@ -190,6 +193,115 @@ def extract_batch_rust(
             pl.DataFrame(status_rows, schema=STATUS_SCHEMA) if status_rows else empty_status_df()
         )
         return chats_df, status_df
+
+
+def stream_batch_rust(
+    jobs: Iterable[MatchReplayJob],
+    concurrency: int = 64,
+    max_per_host: int = 6,
+    flush_every: int = 250,
+    timeout_s: int = 120,
+    retries: int = 2,
+    verbose: bool = True,
+):
+    """Continuously stream matches through a single Rust worker pool with zero chunk barriers.
+
+    Yields `(chats_df, status_df)` every `flush_every` completed matches while keeping all
+    `concurrency` download/parse workers 100% saturated (eliminating slow-replay stragglers).
+    Gracefully flushes completed matches even if interrupted via KeyboardInterrupt.
+    """
+    job_list = list(jobs)
+    if not job_list:
+        return
+
+    binary = find_rust_binary()
+    if binary is None:
+        raise FileNotFoundError(
+            "deadlock-chat-extractor binary not found. Build it with `build_rust_binary()`."
+        )
+
+    flush_every = max(1, int(flush_every))
+
+    with tempfile.TemporaryDirectory(prefix="deadlock_chat_stream_") as tmpdir:
+        jobs_file = Path(tmpdir) / "jobs.jsonl"
+        with jobs_file.open("w", encoding="utf-8") as f:
+            for j in job_list:
+                f.write(json.dumps(j.to_job_dict()) + "\n")
+
+        cmd = [
+            str(binary),
+            "batch",
+            "--input",
+            str(jobs_file),
+            "--stream",
+            "--concurrency",
+            str(concurrency),
+            "--max-per-host",
+            str(max_per_host),
+            "--timeout",
+            str(timeout_s),
+            "--retries",
+            str(retries),
+        ]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=None if verbose else subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
+        chat_buf: list[dict] = []
+        status_buf: list[dict] = []
+        interrupted = False
+
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                ev = json.loads(line)
+                kind = ev.pop("kind", None)
+                if kind == "chat":
+                    chat_buf.append(ev)
+                elif kind == "status":
+                    ev.setdefault("error", None)
+                    status_buf.append(ev)
+                    if len(status_buf) >= flush_every:
+                        chats_df = (
+                            pl.DataFrame(chat_buf, schema=CHAT_SCHEMA)
+                            if chat_buf
+                            else empty_chats_df()
+                        )
+                        status_df = pl.DataFrame(status_buf, schema=STATUS_SCHEMA)
+                        chat_buf.clear()
+                        status_buf.clear()
+                        yield chats_df, status_df
+        except KeyboardInterrupt:
+            interrupted = True
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        finally:
+            if chat_buf or status_buf:
+                chats_df = (
+                    pl.DataFrame(chat_buf, schema=CHAT_SCHEMA) if chat_buf else empty_chats_df()
+                )
+                status_df = (
+                    pl.DataFrame(status_buf, schema=STATUS_SCHEMA)
+                    if status_buf
+                    else empty_status_df()
+                )
+                yield chats_df, status_df
+
+            if not interrupted:
+                rc = proc.wait()
+                if rc != 0:
+                    raise subprocess.CalledProcessError(rc, cmd)
 
 
 def decompress_to_file(src: Path, dst: Path) -> None:

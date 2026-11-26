@@ -36,6 +36,7 @@ class MatchReplayJob:
         d: dict[str, Any] = {
             "match_id": int(self.match_id),
             "demo_url": self.demo_url,
+            "cluster_id": int(self.cluster_id),
         }
         if self.start_time is not None:
             d["start_time"] = int(self.start_time)
@@ -92,61 +93,107 @@ class DeadlockApiClient:
         con.execute("INSTALL httpfs; LOAD httpfs;")
         return con
 
+    def _get_cached_salts_parquet(self, days_back: int, cache_dir: str | None = None) -> str:
+        """Cache the filtered recent match_salts subset in /tmp so repeat runs start instantly."""
+        import pathlib
+        import tempfile
+
+        manifest = self.get_manifest()
+        version = manifest.get("version", "latest")
+        base_dir = pathlib.Path(cache_dir) if cache_dir else pathlib.Path(tempfile.gettempdir()) / "deadlock_salts_cache"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        cached_file = base_dir / f"match_salts_v{version}_d{int(days_back)}.parquet"
+
+        if cached_file.is_file() and (time.time() - cached_file.stat().st_mtime) < 6 * 3600:
+            return str(cached_file)
+
+        salt_urls = self.get_table_urls("match_salts")
+        tmp_file = cached_file.with_suffix(".tmp.parquet")
+        con = self._new_duckdb_httpfs()
+        con.execute(
+            f"""
+            COPY (
+                SELECT match_id, cluster_id, replay_salt, CAST(epoch(created_at) AS BIGINT) AS created_ts
+                FROM read_parquet({salt_urls!r})
+                WHERE replay_salt IS NOT NULL
+                  AND cluster_id IS NOT NULL
+                  AND match_id >= {MIN_VALID_MATCH_ID}
+                  AND match_id < {MAX_VALID_MATCH_ID}
+                  AND created_at >= current_timestamp - INTERVAL {int(days_back)} DAY
+                ORDER BY match_id DESC
+            ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        con.close()
+        tmp_file.replace(cached_file)
+        return str(cached_file)
+
     def fetch_recent_replay_jobs_from_lake(
         self,
         days_back: int = 14,
         limit: int = 1000,
         exclude_match_ids: set[int] | None = None,
         newest_first: bool = True,
+        worker_id: int = 0,
+        num_workers: int = 1,
+        use_local_cache: bool = True,
     ) -> list[MatchReplayJob]:
-        """Query the public `match_salts` Parquet snapshot via DuckDB HTTP range requests.
+        """Query recent valid `match_salts` rows with optional multi-worker modulo sharding.
 
-        Returns up to `limit` valid matches with `replay_salt IS NOT NULL` created within
-        `days_back` days (Valve retains Deadlock replays for ~14-21 days).
+        Setting `num_workers > 1` with distinct `worker_id` in `[0, num_workers)` lets
+        multiple Colab tabs or VMs harvest disjoint match slices in parallel with zero overlap.
         """
-        salt_urls = self.get_table_urls("match_salts")
-        con = self._new_duckdb_httpfs()
+        if num_workers < 1 or not (0 <= worker_id < num_workers):
+            raise ValueError(f"Invalid worker sharding: worker_id={worker_id}, num_workers={num_workers}")
+
+        shard_clause = (
+            f"AND (s.match_id % {int(num_workers)}) = {int(worker_id)}"
+            if num_workers > 1
+            else ""
+        )
         order = "DESC" if newest_first else "ASC"
 
-        # Fetch extra rows if we need to filter out previously processed match_ids
-        fetch_limit = limit + (len(exclude_match_ids) if exclude_match_ids else 0)
-        # Cap query fetch to keep memory low when exclude set is very large
-        if exclude_match_ids and len(exclude_match_ids) > 50_000:
+        if use_local_cache:
+            local_parquet = self._get_cached_salts_parquet(days_back=days_back)
+            con = duckdb.connect()
+            source_sql = f"read_parquet('{local_parquet}')"
+            ts_col = "s.created_ts"
+            extra_where = ""
+        else:
+            salt_urls = self.get_table_urls("match_salts")
+            con = self._new_duckdb_httpfs()
+            source_sql = f"read_parquet({salt_urls!r})"
+            ts_col = "CAST(epoch(s.created_at) AS BIGINT)"
+            extra_where = (
+                f"AND s.replay_salt IS NOT NULL AND s.cluster_id IS NOT NULL "
+                f"AND s.match_id >= {MIN_VALID_MATCH_ID} AND s.match_id < {MAX_VALID_MATCH_ID} "
+                f"AND s.created_at >= current_timestamp - INTERVAL {int(days_back)} DAY"
+            )
+
+        if exclude_match_ids:
             con.execute("CREATE TEMP TABLE _seen (match_id UBIGINT)")
             con.executemany(
                 "INSERT INTO _seen VALUES (?)",
                 [(int(mid),) for mid in exclude_match_ids],
             )
             query = f"""
-            SELECT s.match_id, s.cluster_id, s.replay_salt, CAST(epoch(s.created_at) AS BIGINT)
-            FROM read_parquet({salt_urls!r}) s
+            SELECT s.match_id, s.cluster_id, s.replay_salt, {ts_col}
+            FROM {source_sql} s
             LEFT ANTI JOIN _seen ON s.match_id = _seen.match_id
-            WHERE s.replay_salt IS NOT NULL
-              AND s.cluster_id IS NOT NULL
-              AND s.match_id >= {MIN_VALID_MATCH_ID}
-              AND s.match_id < {MAX_VALID_MATCH_ID}
-              AND s.created_at >= current_timestamp - INTERVAL {int(days_back)} DAY
+            WHERE 1=1 {extra_where} {shard_clause}
             ORDER BY s.match_id {order}
             LIMIT {int(limit)}
             """
             rows = con.execute(query).fetchall()
         else:
             query = f"""
-            SELECT match_id, cluster_id, replay_salt, CAST(epoch(created_at) AS BIGINT)
-            FROM read_parquet({salt_urls!r})
-            WHERE replay_salt IS NOT NULL
-              AND cluster_id IS NOT NULL
-              AND match_id >= {MIN_VALID_MATCH_ID}
-              AND match_id < {MAX_VALID_MATCH_ID}
-              AND created_at >= current_timestamp - INTERVAL {int(days_back)} DAY
-            ORDER BY match_id {order}
-            LIMIT {int(min(fetch_limit, max(limit * 3, 5000)))}
+            SELECT s.match_id, s.cluster_id, s.replay_salt, {ts_col}
+            FROM {source_sql} s
+            WHERE 1=1 {extra_where} {shard_clause}
+            ORDER BY s.match_id {order}
+            LIMIT {int(limit)}
             """
             rows = con.execute(query).fetchall()
-            if exclude_match_ids:
-                rows = [r for r in rows if int(r[0]) not in exclude_match_ids][:limit]
-            else:
-                rows = rows[:limit]
 
         con.close()
         return [

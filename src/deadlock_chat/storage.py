@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -11,6 +13,19 @@ import duckdb
 import polars as pl
 
 from .extractor import CHAT_SCHEMA, empty_chats_df
+
+
+def _stage_and_move_parquet(df: pl.DataFrame, dest: Path, compression_level: int = 6) -> Path:
+    """Write Zstd Parquet to fast local /tmp first, then move to dest (Google Drive FUSE friendly)."""
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tf:
+        tmp_path = Path(tf.name)
+    try:
+        df.write_parquet(tmp_path, compression="zstd", compression_level=compression_level)
+        shutil.move(str(tmp_path), str(dest))
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return dest
 
 
 def _query_pl(
@@ -44,8 +59,8 @@ class ChatLake:
 
     Layout (Google Drive friendly — append-only Parquet shards, zero locking):
       <root>/
-        chats/part-<ts>-<id>.parquet   (Zstd-compressed chat message shards)
-        state/proc-<ts>-<id>.parquet   (processed match checkpoint shards)
+        chats/part-<ts>-w<worker>-<id>.parquet   (Zstd-compressed chat message shards)
+        state/proc-<ts>-w<worker>-<id>.parquet   (processed match checkpoint shards)
     """
 
     def __init__(self, root_dir: Path | str) -> None:
@@ -61,26 +76,24 @@ class ChatLake:
     def _state_files(self) -> list[str]:
         return sorted(str(p) for p in self.state_dir.glob("*.parquet"))
 
-    def append_chats(self, df: pl.DataFrame) -> Path | None:
+    def append_chats(self, df: pl.DataFrame, worker_id: int = 0) -> Path | None:
         """Write a batch of extracted chat messages to an immutable Zstd Parquet shard."""
         if df.is_empty():
             return None
         ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        shard = self.chats_dir / f"part-{ts}-{uuid.uuid4().hex[:8]}.parquet"
+        shard = self.chats_dir / f"part-{ts}-w{int(worker_id)}-{uuid.uuid4().hex[:8]}.parquet"
         # Sort by (account_id, start_time, tick) so DuckDB row-group zone maps prune fast
         sorted_df = df.cast(CHAT_SCHEMA).sort(["account_id", "start_time", "tick"])
-        sorted_df.write_parquet(shard, compression="zstd", compression_level=6)
-        return shard
+        return _stage_and_move_parquet(sorted_df, shard, compression_level=6)
 
-    def append_status(self, status_df: pl.DataFrame) -> Path | None:
+    def append_status(self, status_df: pl.DataFrame, worker_id: int = 0) -> Path | None:
         """Persist processed match checkpoint records (enables seamless resume in Colab)."""
         if status_df.is_empty():
             return None
         ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        shard = self.state_dir / f"proc-{ts}-{uuid.uuid4().hex[:8]}.parquet"
+        shard = self.state_dir / f"proc-{ts}-w{int(worker_id)}-{uuid.uuid4().hex[:8]}.parquet"
         enriched = status_df.with_columns(pl.lit(int(time.time())).cast(pl.Int64).alias("processed_at"))
-        enriched.write_parquet(shard, compression="zstd", compression_level=3)
-        return shard
+        return _stage_and_move_parquet(enriched, shard, compression_level=3)
 
     def get_processed_match_ids(self, include_errors: bool = False) -> set[int]:
         """Return all match IDs already processed (ok, no_chat, http_404)."""

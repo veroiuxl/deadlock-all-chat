@@ -42,11 +42,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # harvest
     p_harv = sub.add_parser("harvest", help="Bulk-harvest chat messages from recent Deadlock replays")
-    p_harv.add_argument("--matches", type=int, default=200, help="Number of new matches to attempt")
-    p_harv.add_argument("--chunk-size", type=int, default=50, help="Matches per checkpointed shard")
-    p_harv.add_argument("--concurrency", type=int, default=16, help="Concurrent HTTP+parse streams")
-    p_harv.add_argument("--days-back", type=int, default=14, help="Lookback window in days")
+    p_harv.add_argument("--matches", type=int, default=1000, help="Number of new matches to attempt")
+    p_harv.add_argument("--flush-every", type=int, default=250, help="Flush Parquet shard every N completed matches")
+    p_harv.add_argument("--concurrency", type=int, default=64, help="Total concurrent HTTP+parse streams")
+    p_harv.add_argument("--max-per-host", type=int, default=6, help="Max concurrent streams per Valve replay cluster")
+    p_harv.add_argument("--days-back", type=int, default=10, help="Lookback window in days")
     p_harv.add_argument("--source", choices=["lake", "live"], default="lake")
+    p_harv.add_argument("--worker-id", type=int, default=0, help="Shard worker ID in [0, num-workers)")
+    p_harv.add_argument("--num-workers", type=int, default=1, help="Total parallel workers sharing the lake")
+    p_harv.add_argument("--no-salts-cache", action="store_true", help="Disable /tmp caching of match_salts")
     p_harv.add_argument("--api-key", default=None)
 
     # lookup
@@ -60,8 +64,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Also scan Deadlock API steam_profile_observed_names for past usernames",
     )
     p_look.add_argument("--days-back", type=int, default=21)
-    p_look.add_argument("--max-live-matches", type=int, default=25)
-    p_look.add_argument("--concurrency", type=int, default=12)
+    p_look.add_argument("--max-live-matches", type=int, default=30)
+    p_look.add_argument("--concurrency", type=int, default=24)
+    p_look.add_argument("--max-per-host", type=int, default=6)
     p_look.add_argument("--chat-type", choices=["all", "team"], default=None)
     p_look.add_argument("--limit", type=int, default=200)
     p_look.add_argument("--api-key", default=None)
@@ -94,10 +99,14 @@ def main(argv: list[str] | None = None) -> int:
         summary = harvest_bulk(
             lake=args.data_dir,
             target_matches=args.matches,
-            chunk_size=args.chunk_size,
+            flush_every=args.flush_every,
             concurrency=args.concurrency,
+            max_per_host=args.max_per_host,
             days_back=args.days_back,
             source=args.source,
+            worker_id=args.worker_id,
+            num_workers=args.num_workers,
+            use_local_salts_cache=not args.no_salts_cache,
             api_key=args.api_key,
         )
         print(json.dumps(summary, indent=2))
@@ -115,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             days_back=args.days_back,
             max_live_matches=args.max_live_matches,
             concurrency=args.concurrency,
+            max_per_host=args.max_per_host,
             chat_type=args.chat_type,
             limit=args.limit,
             api_key=args.api_key,

@@ -1,6 +1,6 @@
 [package]
 name = "deadlock-chat-extractor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Ultra-fast zero-entity-decoding streaming chat message extractor for Deadlock Source 2 replays"
 

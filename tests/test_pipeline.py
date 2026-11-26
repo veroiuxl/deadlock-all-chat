@@ -99,9 +99,11 @@ def test_chat_lake_append_query_and_compact(tmp_path: Path) -> None:
     lake = ChatLake(tmp_path / "lake")
     df = _sample_chats()
 
-    # Append across two shards (including a duplicate row to test deduplication)
-    lake.append_chats(df.slice(0, 2))
-    lake.append_chats(df.slice(1, 3))
+    # Append across two shards from different workers (including a duplicate row to test deduplication)
+    s0 = lake.append_chats(df.slice(0, 2), worker_id=0)
+    s1 = lake.append_chats(df.slice(1, 3), worker_id=1)
+    assert s0 is not None and "-w0-" in s0.name
+    assert s1 is not None and "-w1-" in s1.name
 
     # Substring query by username
     res_sub = lake.query_by_username("alpha")

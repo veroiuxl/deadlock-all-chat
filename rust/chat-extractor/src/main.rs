@@ -11,6 +11,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "deadlock-chat-extractor",
+    version,
     about = "Ultra-fast zero-entity-decoding streaming chat extractor for Deadlock Source 2 replays"
 )]
 struct Cli {
@@ -33,18 +34,24 @@ enum Commands {
     },
     /// Stream-download, decompress, and extract chat messages from a batch of replay URLs (JSONL)
     Batch {
-        /// Path to JSONL file of {"match_id": ..., "demo_url": ..., "start_time": ...} or '-' for stdin
+        /// Path to JSONL file of {"match_id", "demo_url", "cluster_id", "start_time"} or '-' for stdin
         #[arg(short, long)]
         input: PathBuf,
-        /// Output NDJSON file for extracted chat message records
+        /// Output NDJSON file for extracted chat message records (optional when --stream is set)
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Optional NDJSON file for per-match status/checkpoint records
         #[arg(short, long)]
         status: Option<PathBuf>,
-        /// Number of concurrent streaming downloads + parsers
-        #[arg(short, long, default_value_t = 16)]
+        /// Stream tagged {"kind":"chat"|"status", ...} NDJSON events live to stdout as each match finishes
+        #[arg(long)]
+        stream: bool,
+        /// Total concurrent streaming downloads + parsers
+        #[arg(short, long, default_value_t = 64)]
         concurrency: usize,
+        /// Max concurrent downloads per Valve replay cluster host (prevents per-host throttling)
+        #[arg(long, default_value_t = 6)]
+        max_per_host: usize,
         /// Per-match HTTP timeout in seconds
         #[arg(long, default_value_t = 120)]
         timeout: u64,
@@ -89,18 +96,22 @@ async fn main() -> Result<()> {
             input,
             output,
             status,
+            stream,
             concurrency,
+            max_per_host,
             timeout,
             retries,
         } => {
-            batch::run_batch(
-                &input,
-                &output,
-                status.as_deref(),
+            batch::run_batch(batch::BatchConfig {
+                input_path: &input,
+                output_path: output.as_deref(),
+                status_path: status.as_deref(),
+                stream_stdout: stream,
                 concurrency,
-                timeout,
-                retries,
-            )
+                max_per_host,
+                timeout_secs: timeout,
+                max_retries: retries,
+            })
             .await?;
         }
     }
